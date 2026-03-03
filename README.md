@@ -7,15 +7,16 @@ No dashboards. No cloud. Just bash, tmux, and GitHub.
 ## How it works
 
 ```
-spawn-agent.sh  →  tmux session with Codex/Claude
-                →  agent writes code, opens PR
-check-agents.sh →  CI passes? run local-review.sh
-                →  Codex + Claude review via commit statuses
-                →  all green → notify "ready for review"
-                →  CI failed → respawn with review comments
+spawn-agent.sh  →  git worktree + tmux session
+                →  Codex or Claude writes code, opens PR
+
+check-agents.sh →  runs every 10 min via cron
+                →  CI passed? → trigger local-review.sh
+                →  all reviews green → notify "ready for review"
+                →  CI or review failed → respawn with failure context
 ```
 
-The monitor runs on a cron every 10 minutes and calls `check-agents.sh --all`. When a PR is ready, it writes to `notifications.pending` — hook that into anything (Telegram, Slack, webhook, whatever).
+Each task runs in its own git worktree so multiple agents can work in parallel without stepping on each other.
 
 ## Requirements
 
@@ -30,14 +31,18 @@ The monitor runs on a cron every 10 minutes and calls `check-agents.sh --all`. W
 
 ```bash
 git clone https://github.com/YOUR_USER/agent-swarm ~/.agent-swarm
-export SWARM_HOME=~/.agent-swarm  # add this to ~/.zshrc or ~/.bashrc
 ```
 
-Copy the example project config:
+Add to `~/.zshrc` or `~/.bashrc`:
+
+```bash
+export SWARM_HOME=~/.agent-swarm
+```
+
+Copy and edit the example project config:
 
 ```bash
 cp ~/.agent-swarm/projects/example.json ~/.agent-swarm/projects/myproject.json
-# edit it
 ```
 
 Add a cron:
@@ -69,8 +74,6 @@ Add a cron:
 }
 ```
 
-`requireGemini: true` blocks merge until Gemini Code Assist posts a passing review. The GitHub App is free to install.
-
 ## Spawning a task
 
 ```bash
@@ -83,25 +86,39 @@ bash ~/.agent-swarm/scripts/spawn-agent.sh \
 
 Agent type: `codex` | `claude` | `auto`
 
-`auto` routes frontend/UI tasks to Claude, everything else to Codex.
+`auto` routes frontend/UI tasks (React, CSS, Tailwind, components) to Claude and everything else to Codex.
 
 Use `--fix` for `fix/task-id` branches instead of `feat/task-id`.
 
-## Mid-task steering
+## Reviews
 
-If the agent is going in the wrong direction:
+After CI passes, `local-review.sh` runs automatically. It sets four GitHub commit statuses:
 
-```bash
-tmux send-keys -t fix-login-bug "Don't touch session.ts, the bug is in middleware/auth.ts" Enter
+### local/codex-review
+
+Codex reads the PR diff and outputs `VERDICT: PASS` or `VERDICT: FAIL` with a list of bugs, regressions, or security issues. Style nitpicks are ignored. The result is posted as a PR comment.
+
+### local/claude-review
+
+Claude runs in critical-only mode — it only flags things that will crash in production, cause data loss, create a security vulnerability, or break existing functionality. If nothing critical, it passes. Also posted as a PR comment.
+
+### local/screenshot-gate
+
+If the PR touches UI files (`.tsx`, `.jsx`, `.css`, `.scss`, `.vue`, `.svelte`), it checks whether the PR description contains a screenshot. No screenshot → fail. Non-UI PRs pass automatically.
+
+### local/gemini-review
+
+Checks whether Gemini Code Assist (GitHub App) has reviewed or commented on the PR. If `requireGemini: true` in the project config, this gate must pass before the task is marked `review_ready`. The app is free to install at [github.com/apps/gemini-code-assist](https://github.com/apps/gemini-code-assist).
+
+To require Gemini before merge:
+
+```json
+"requireGemini": true
 ```
 
-## Checking status
+### GitHub token permissions
 
-```bash
-bash ~/.agent-swarm/scripts/check-agents.sh --project myproject
-# or
-bash ~/.agent-swarm/scripts/check-agents.sh --all
-```
+The `gh` CLI needs permission to set commit statuses. Make sure your token has the `repo` scope (or `statuses:write` for fine-grained tokens).
 
 ## Notifications
 
@@ -109,21 +126,43 @@ When something happens, a line is appended to `$SWARM_HOME/notifications.pending
 
 ```
 [2026-03-03T10:00:00Z] NOTIFY: [myproject] Task fix-login-bug PR #12 ready for review
+[2026-03-03T10:05:00Z] NOTIFY: [myproject] Task fix-login-bug PR #12 Claude review FAILED
+[2026-03-03T10:10:00Z] NOTIFY: [myproject] AGENT EXHAUSTED fix-login-bug — all 3 attempts used
 ```
 
-Read and clear it however you want.
+Read and clear it however you want — cron, webhook, custom script.
 
 ## Auto-retry
 
-When CI or review fails, the swarm respawns the agent with the review comments as context. Up to `maxAttempts` tries. After that, you get an `AGENT EXHAUSTED` notification.
+When CI or a review fails, the swarm respawns the agent with the failure context (review comments, failed check names, original task prompt) injected into the new prompt. This repeats up to `maxAttempts` times.
 
-Manual respawn:
+After all attempts are exhausted, you get an `AGENT EXHAUSTED` notification and handle it yourself.
+
+Manual respawn with a corrected prompt:
 
 ```bash
 bash ~/.agent-swarm/scripts/respawn-agent.sh \
   --project myproject \
   fix-login-bug \
   "Previous attempt broke the tests. Fix only session handling, don't touch the router."
+```
+
+## Mid-task steering
+
+If the agent is going in the wrong direction, send it a message directly in tmux:
+
+```bash
+tmux send-keys -t fix-login-bug "Don't touch session.ts, the bug is in middleware/auth.ts" Enter
+```
+
+The inner session name matches the task ID.
+
+## Checking status
+
+```bash
+bash ~/.agent-swarm/scripts/check-agents.sh --project myproject
+# or all projects at once
+bash ~/.agent-swarm/scripts/check-agents.sh --all
 ```
 
 ## Directory structure
@@ -133,24 +172,24 @@ bash ~/.agent-swarm/scripts/respawn-agent.sh \
   scripts/
     spawn-agent.sh       # create worktree + start agent
     run-agent.sh         # run codex/claude in tmux, handle exit
-    check-agents.sh      # poll PR status, trigger reviews
-    local-review.sh      # run reviews, set commit statuses
-    respawn-agent.sh     # retry failed task with new prompt
+    check-agents.sh      # poll PR/CI status, trigger reviews, auto-retry
+    local-review.sh      # codex + claude + gemini + screenshot review
+    respawn-agent.sh     # retry a failed task with a new prompt
     monitor-loop.sh      # cron entrypoint
-    cleanup-agents.sh    # remove stale worktrees and sessions
+    cleanup-agents.sh    # remove stale worktrees and tmux sessions
   projects/
-    myproject.json
+    example.json
   .prompts/
     myproject/
-      fix-login-bug.txt  # auto-created by spawn-agent.sh
-  notifications.pending
-  monitor.log
-  patterns.log
+      fix-login-bug.txt  # task prompt, auto-created by spawn-agent.sh
+  notifications.pending  # append-only event log
+  monitor.log            # full scheduler output
+  patterns.log           # hints accumulated from successful runs
 ```
 
 ## AGENTS.md
 
-Put an `AGENTS.md` in your repo root. The swarm reads it at the start of every task. The agent will make fewer mistakes.
+Put an `AGENTS.md` in your repo root. The swarm reads it at the start of every task. Less context = more mistakes.
 
 ```markdown
 # AGENTS.md
@@ -168,5 +207,6 @@ Put an `AGENTS.md` in your repo root. The swarm reads it at the start of every t
 ## Tips
 
 - Keep tasks small. "Refactor the entire auth system" will fail. "Extract token refresh into a separate service" will work.
-- Gemini Code Assist (GitHub App, free) catches stuff Codex and Claude miss. Worth installing.
-- `patterns.log` accumulates hints from successful runs — the respawn logic uses it when retrying.
+- Gemini Code Assist is free and independent from Codex/Claude — it catches different things. Worth installing.
+- `patterns.log` accumulates hints from successful runs and gets injected into retry prompts automatically.
+- The `auto` agent type works well as a default once you know your codebase is split between backend and frontend.
