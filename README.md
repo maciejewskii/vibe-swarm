@@ -210,3 +210,43 @@ Put an `AGENTS.md` in your repo root. The swarm reads it at the start of every t
 - Gemini Code Assist is free and independent from Codex/Claude — it catches different things. Worth installing.
 - `patterns.log` accumulates hints from successful runs and gets injected into retry prompts automatically.
 - The `auto` agent type works well as a default once you know your codebase is split between backend and frontend.
+
+## Orchestration with OpenClaw
+
+The swarm is headless by design — it doesn’t know what to build or when. That’s the orchestrator’s job.
+
+In this setup, [OpenClaw](https://github.com/openclaw/openclaw) acts as the brain. It runs as a persistent AI agent connected to Telegram (or any other channel). It reads `notifications.pending` on a heartbeat schedule, decides what needs attention, spawns tasks, and steers agents mid-run.
+
+### How the loop works
+
+```
+You (Telegram)  →  OpenClaw  →  spawn-agent.sh  →  Codex/Claude
+                                                  →  PR opens
+notifications.pending  →  OpenClaw heartbeat  →  you get pinged
+You approve  →  gh pr merge
+```
+
+1. You describe a task to OpenClaw in plain language
+2. OpenClaw calls `spawn-agent.sh` with the right project, task ID, agent type, and prompt
+3. The agent works, opens a PR
+4. `check-agents.sh` runs on cron, reviews complete, a line is written to `notifications.pending`
+5. OpenClaw reads `notifications.pending` on the next heartbeat and messages you
+6. You review the PR and merge
+
+If a review fails or an agent gets stuck, OpenClaw handles the respawn — with context from the failure injected into the new prompt.
+
+### OpenClaw HEARTBEAT.md example
+
+```markdown
+## Agent Swarm notifications
+
+Check ~/. agent-swarm/notifications.pending.
+- If it has content: read it, send each line to Telegram, then clear the file.
+- If empty: do nothing.
+```
+
+### Why this works
+
+The swarm handles the mechanical parts: worktrees, tmux sessions, PR lifecycle, commit statuses, retry logic. OpenClaw handles judgment: what to build, when to intervene, when to escalate. Neither needs to know the internals of the other.
+
+You end up with a setup where you can describe a task over Telegram while commuting, and by the time you're back at your desk there's a PR waiting for review.
