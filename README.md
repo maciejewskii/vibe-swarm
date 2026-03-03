@@ -273,3 +273,48 @@ bash ~/.vibe-swarm/scripts/check-agents.sh --all
 - Gemini Code Assist is free and independent — catches different things than Codex and Claude.
 - `auto` agent routing works well as a default once you have a clear frontend/backend split.
 - The whole thing runs on a laptop or a cheap VPS. No cloud infra needed.
+
+## OpenClaw as the brain
+
+The swarm handles mechanics — worktrees, tmux, PR lifecycle, reviews, retries. It doesn't have opinions. OpenClaw is the layer that does.
+
+[OpenClaw](https://github.com/openclaw/openclaw) is a self-hosted AI agent that runs continuously and connects to your phone via Telegram (or Slack, Signal, Discord). In this setup it acts as the orchestrator — the thing that decides what gets built, when to intervene, and when to let the swarm handle it.
+
+**What OpenClaw does in this setup:**
+
+- You describe a task in plain language on Telegram. OpenClaw interprets it and calls `spawn-agent.sh` with the right project, task ID, agent type, and prompt.
+- It reads `notifications.pending` on a heartbeat and forwards events to your phone the moment they happen.
+- When an agent gets stuck or goes in the wrong direction, you tell OpenClaw. It sends the correction into the agent's tmux session.
+- When a review fails, OpenClaw decides whether to respawn automatically or escalate to you based on the failure type.
+- It maintains memory across sessions — knows your projects, conventions, what failed last time, what to avoid.
+
+**The full loop:**
+
+```
+You (Telegram, on your phone)
+  "Add PDF export to invoices. Use InvoiceService. Prices in EUR."
+  ↓
+OpenClaw
+  ↓ spawn-agent.sh --project myproject add-invoice-pdf codex "..."
+Codex (tmux + worktree)
+  ↓ writes code, opens PR
+check-agents.sh
+  ↓ CI + reviews pass
+  ↓ notifications.pending ← "PR #42 ready for review"
+OpenClaw heartbeat
+  ↓ forwards to Telegram
+You
+  → open PR on phone, merge
+```
+
+Without OpenClaw the swarm still works — you run `spawn-agent.sh` manually and check `notifications.pending` yourself. OpenClaw just makes it hands-free.
+
+**OpenClaw HEARTBEAT.md example:**
+
+```markdown
+## Agent swarm
+
+Check $SWARM_HOME/notifications.pending.
+- If it has content: read it, send each NOTIFY line to Telegram, then clear the file.
+- If empty: skip.
+```
