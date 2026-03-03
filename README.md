@@ -1,23 +1,43 @@
 # vibe-swarm
 
-One-person dev team powered by Codex and Claude. You describe a task, agents write the code and open PRs, reviews run automatically, you merge.
+Bash-based agent swarm built on top of [OpenClaw](https://github.com/openclaw/openclaw). You describe a task on Telegram, agents write the code and open PRs, reviews run automatically, you merge.
 
 No dashboards. No cloud. Just bash, tmux, and GitHub.
 
-## The workflow
+## Built on OpenClaw
+
+[OpenClaw](https://github.com/openclaw/openclaw) is a self-hosted AI agent that runs continuously and connects to your phone via Telegram (or Slack, Signal, Discord). vibe-swarm is the coding layer on top of it.
+
+OpenClaw acts as the brain:
+
+- You describe a task in plain language on Telegram. OpenClaw interprets it and calls `spawn-agent.sh` with the right project, task ID, agent type, and prompt.
+- It reads `notifications.pending` on a heartbeat and forwards events to your phone the moment they happen.
+- When an agent gets stuck, you tell OpenClaw. It sends the correction into the agent's tmux session.
+- When a review fails, OpenClaw decides whether to respawn automatically or escalate to you.
+- It maintains memory across sessions — knows your projects, conventions, what failed last time, what to avoid.
+
+vibe-swarm handles the mechanics: worktrees, tmux, PR lifecycle, reviews, retries. OpenClaw handles judgment.
+
+You can also run vibe-swarm without OpenClaw — call `spawn-agent.sh` manually and check `notifications.pending` yourself.
+
+## The full loop
 
 ```
-You (Telegram / terminal)
+You (Telegram, on your phone)
+  "Add PDF export to invoices. Use InvoiceService. Prices in EUR."
   ↓
-OpenClaw (AI orchestrator) — or you directly via CLI
-  ↓ spawn-agent.sh
+OpenClaw
+  ↓ spawn-agent.sh --project myproject add-invoice-pdf codex "..."
 Codex / Claude (tmux + git worktree)
   ↓ writes code, opens PR
 check-agents.sh (cron, every 10 min)
   ↓ CI passed → local-review.sh
   ↓ Codex review + Claude review + Gemini + screenshot gate
-  → all green → notifications.pending → you get pinged
-  → review failed → respawn with failure context injected
+  ↓ all green → notifications.pending ← "PR #42 ready for review"
+OpenClaw heartbeat
+  ↓ forwards to Telegram
+You
+  → open PR on phone, merge
 ```
 
 Each task gets its own git worktree and tmux session. Multiple agents can run in parallel.
@@ -30,6 +50,7 @@ Each task gets its own git worktree and tmux session. Multiple agents can run in
 - gh (GitHub CLI, authenticated)
 - codex CLI — `npm install -g @openai/codex`
 - claude CLI — `npm install -g @anthropic-ai/claude-code`
+- [OpenClaw](https://github.com/openclaw/openclaw) (optional, for hands-free orchestration)
 
 ## Setup
 
@@ -96,7 +117,7 @@ Use `--fix` for `fix/task-id` branches instead of `feat/task-id`.
 
 ## Giving agents context
 
-Agents start fresh each run. Without context they make generic decisions. The more you give them upfront, the fewer corrections you need mid-run.
+Agents start fresh each run. The more context you give them upfront, the fewer corrections you need mid-run.
 
 ### AGENTS.md in the repo root
 
@@ -121,7 +142,7 @@ Put `AGENTS.md` in your repo root. Every agent reads it before starting. Cover s
 
 ### Business context in the prompt
 
-The task prompt is the main channel for business context. Be explicit about constraints, edge cases, which files to touch, and what to avoid:
+Be explicit about constraints, edge cases, which files to touch, and what to avoid:
 
 ```bash
 bash ~/.vibe-swarm/scripts/spawn-agent.sh \
@@ -150,6 +171,23 @@ bash ~/.vibe-swarm/scripts/spawn-agent.sh \
   Task: Fix ProductRepository.findAll() missing tenantId filter."
 ```
 
+### External knowledge sources
+
+You can feed agents any external knowledge before spawning — Obsidian vault, internal docs, database schema, architecture decisions:
+
+```bash
+SCHEMA=$(pg_dump --schema-only mydb | grep -A 20 'CREATE TABLE orders')
+DOCS=$(cat ~/obsidian/projects/myproject/orders.md)
+
+bash ~/.vibe-swarm/scripts/spawn-agent.sh \
+  --project myproject fix-order-total codex \
+  "$SCHEMA
+
+$DOCS
+
+Task: Fix order total calculation not including VAT."
+```
+
 ## Reviews
 
 After CI passes, `local-review.sh` runs automatically and sets four GitHub commit statuses.
@@ -160,7 +198,7 @@ Codex reads the PR diff and outputs `VERDICT: PASS` or `VERDICT: FAIL` with bugs
 
 ### local/claude-review
 
-Claude runs in critical-only mode — only flags things that will crash in production, cause data loss, create a security vulnerability, or break existing functionality. If nothing critical, it passes. Also posted as PR comment.
+Claude runs in critical-only mode — only flags things that will crash in production, cause data loss, create a security vulnerability, or break existing functionality. Also posted as PR comment.
 
 ### local/screenshot-gate
 
@@ -191,7 +229,7 @@ bash ~/.vibe-swarm/scripts/respawn-agent.sh \
 
 ## patterns.log
 
-When an agent succeeds after a retry, a hint is written to `patterns.log`. On future retries for similar tasks, these hints are injected into the prompt automatically. You can also edit the file manually to add project-specific guidance.
+When an agent succeeds after a retry, a hint is written to `patterns.log`. On future retries for similar tasks, these hints are injected into the prompt automatically. You can also edit it manually to add project-specific guidance.
 
 ## Mid-task steering
 
@@ -213,12 +251,6 @@ Events are appended to `$SWARM_HOME/notifications.pending`:
 [2026-03-03T10:10:00Z] NOTIFY: [myproject] AGENT EXHAUSTED fix-login-bug — all 3 attempts used
 ```
 
-Read and clear it however you want.
-
-### Instant notifications with OpenClaw
-
-[OpenClaw](https://github.com/openclaw/openclaw) can act as the orchestrator and notification layer. It reads `notifications.pending` on a heartbeat and forwards events to Telegram (or Slack, Signal, Discord). It can also spawn tasks, steer agents mid-run, and decide when to intervene vs. let the swarm retry.
-
 `notify-instant.sh` uses a filesystem watcher (macOS `launchd` WatchPaths or Linux `inotifywait`) to trigger the moment something is written — no waiting for the next cron tick.
 
 launchd plist example:
@@ -235,7 +267,15 @@ launchd plist example:
 </array>
 ```
 
-Set `NOTIFY_CHANNEL`, `NOTIFY_TARGET`, and `OPENCLAW_CONFIG` environment variables.
+OpenClaw HEARTBEAT.md:
+
+```markdown
+## Agent swarm
+
+Check $SWARM_HOME/notifications.pending.
+- If it has content: read it, send each NOTIFY line to Telegram, then clear the file.
+- If empty: skip.
+```
 
 ## Checking status
 
@@ -261,7 +301,7 @@ bash ~/.vibe-swarm/scripts/check-agents.sh --all
     example.json
   .prompts/
     myproject/
-      fix-login-bug.txt  # auto-created by spawn-agent.sh
+      fix-login-bug.txt
   notifications.pending
   monitor.log
   patterns.log
@@ -273,76 +313,3 @@ bash ~/.vibe-swarm/scripts/check-agents.sh --all
 - Gemini Code Assist is free and independent — catches different things than Codex and Claude.
 - `auto` agent routing works well as a default once you have a clear frontend/backend split.
 - The whole thing runs on a laptop or a cheap VPS. No cloud infra needed.
-
-## OpenClaw as the brain
-
-The swarm handles mechanics — worktrees, tmux, PR lifecycle, reviews, retries. It doesn't have opinions. OpenClaw is the layer that does.
-
-[OpenClaw](https://github.com/openclaw/openclaw) is a self-hosted AI agent that runs continuously and connects to your phone via Telegram (or Slack, Signal, Discord). In this setup it acts as the orchestrator — the thing that decides what gets built, when to intervene, and when to let the swarm handle it.
-
-**What OpenClaw does in this setup:**
-
-- You describe a task in plain language on Telegram. OpenClaw interprets it and calls `spawn-agent.sh` with the right project, task ID, agent type, and prompt.
-- It reads `notifications.pending` on a heartbeat and forwards events to your phone the moment they happen.
-- When an agent gets stuck or goes in the wrong direction, you tell OpenClaw. It sends the correction into the agent's tmux session.
-- When a review fails, OpenClaw decides whether to respawn automatically or escalate to you based on the failure type.
-- It maintains memory across sessions — knows your projects, conventions, what failed last time, what to avoid.
-
-**The full loop:**
-
-```
-You (Telegram, on your phone)
-  "Add PDF export to invoices. Use InvoiceService. Prices in EUR."
-  ↓
-OpenClaw
-  ↓ spawn-agent.sh --project myproject add-invoice-pdf codex "..."
-Codex (tmux + worktree)
-  ↓ writes code, opens PR
-check-agents.sh
-  ↓ CI + reviews pass
-  ↓ notifications.pending ← "PR #42 ready for review"
-OpenClaw heartbeat
-  ↓ forwards to Telegram
-You
-  → open PR on phone, merge
-```
-
-Without OpenClaw the swarm still works — you run `spawn-agent.sh` manually and check `notifications.pending` yourself. OpenClaw just makes it hands-free.
-
-**OpenClaw HEARTBEAT.md example:**
-
-```markdown
-## Agent swarm
-
-Check $SWARM_HOME/notifications.pending.
-- If it has content: read it, send each NOTIFY line to Telegram, then clear the file.
-- If empty: skip.
-```
-
-## External knowledge sources
-
-Agents only know what you put in the prompt. Beyond `AGENTS.md` and inline context, you can feed them any external knowledge before spawning:
-
-- **Obsidian vault** — pull relevant notes and prepend to the prompt
-- **Internal docs** — specs, architecture decisions, API contracts
-- **Database schema** — dump the relevant tables so the agent knows the data model
-- **Previous decisions** — why certain things were built the way they were
-
-Example:
-
-```bash
-SCHEMA=$(pg_dump --schema-only mydb | grep -A 20 'CREATE TABLE orders')
-DOCS=$(cat ~/obsidian/projects/myproject/orders.md)
-
-bash ~/.vibe-swarm/scripts/spawn-agent.sh \
-  --project myproject \
-  fix-order-total \
-  codex \
-  "$SCHEMA
-
-$DOCS
-
-Task: Fix order total calculation not including VAT."
-```
-
-The more relevant context the agent has upfront, the fewer wrong assumptions it makes. This is especially useful for domain-specific logic that isn't obvious from the code alone.
