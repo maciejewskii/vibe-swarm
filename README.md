@@ -1,22 +1,76 @@
 # agent-swarm
 
-One-person dev team running on Codex and Claude. You write a task, the swarm spawns an agent in a tmux session, it opens a PR, reviews run automatically, you merge.
+One-person dev team powered by Codex and Claude. You describe a task, agents write the code and open PRs, reviews run automatically, you merge.
 
 No dashboards. No cloud. Just bash, tmux, and GitHub.
 
-## How it works
+## The workflow
+
+The idea comes from how Elvis Presley ran his operation — one person at the center, everything else delegated. You stay at a high level. Agents handle the implementation.
 
 ```
-spawn-agent.sh  →  git worktree + tmux session
-                →  Codex or Claude writes code, opens PR
-
-check-agents.sh →  runs every 10 min via cron
-                →  CI passed? → trigger local-review.sh
-                →  all reviews green → notify "ready for review"
-                →  CI or review failed → respawn with failure context
+You (phone/Telegram)
+  ↓
+OpenClaw (AI orchestrator)
+  ↓ spawn-agent.sh
+Codex / Claude (in tmux + git worktree)
+  ↓ opens PR
+check-agents.sh (cron, every 10 min)
+  ↓ CI passed → local-review.sh
+  ↓ Codex review + Claude review + Gemini + screenshot gate
+  ↓ all green → notifications.pending
+OpenClaw heartbeat
+  ↓ reads notifications.pending
+  ↓ pings you on Telegram
+You
+  → review the PR, merge
 ```
 
-Each task runs in its own git worktree so multiple agents can work in parallel without stepping on each other.
+If CI or a review fails, the swarm respawns the agent automatically with the failure context injected into the prompt. Up to `maxAttempts` retries. After that, you get an `AGENT EXHAUSTED` ping and decide what to do.
+
+You can run multiple agents in parallel. Each task gets its own git worktree and tmux session.
+
+## OpenClaw as the orchestrator
+
+[OpenClaw](https://github.com/openclaw/openclaw) is a self-hosted AI agent that acts as the brain of the operation. It connects to Telegram (or Slack, Signal, Discord) and runs continuously.
+
+It handles:
+- Spawning tasks when you describe them in natural language
+- Reading `notifications.pending` on a heartbeat and forwarding events to your phone
+- Mid-run steering (send a correction to an agent without touching the terminal)
+- Deciding when to intervene vs. let the swarm retry automatically
+
+Without OpenClaw you can still run the swarm manually — it’s just bash scripts. OpenClaw is the layer that makes it hands-free.
+
+### OpenClaw HEARTBEAT.md setup
+
+```markdown
+## Agent swarm
+
+Check $SWARM_HOME/notifications.pending.
+- If it has content: read it line by line, send each NOTIFY line to Telegram, then clear the file.
+- If empty: skip.
+```
+
+### Instant notifications (no cron delay)
+
+`notify-instant.sh` uses a filesystem watcher (macOS `launchd` WatchPaths or Linux `inotifywait`) to fire the moment something is appended to `notifications.pending`. No waiting for the next cron tick.
+
+launchd plist example (macOS):
+
+```xml
+<key>WatchPaths</key>
+<array>
+    <string>/path/to/.agent-swarm/notifications.pending</string>
+</array>
+<key>ProgramArguments</key>
+<array>
+    <string>bash</string>
+    <string>/path/to/.agent-swarm/scripts/notify-instant.sh</string>
+</array>
+```
+
+Set `NOTIFY_CHANNEL` and `NOTIFY_TARGET` env vars, plus `OPENCLAW_CONFIG` pointing to your OpenClaw config file.
 
 ## Requirements
 
@@ -92,33 +146,71 @@ Use `--fix` for `fix/task-id` branches instead of `feat/task-id`.
 
 ## Reviews
 
-After CI passes, `local-review.sh` runs automatically. It sets four GitHub commit statuses:
+After CI passes, `local-review.sh` runs automatically and sets four GitHub commit statuses.
 
 ### local/codex-review
 
-Codex reads the PR diff and outputs `VERDICT: PASS` or `VERDICT: FAIL` with a list of bugs, regressions, or security issues. Style nitpicks are ignored. The result is posted as a PR comment.
+Codex reads the PR diff and outputs `VERDICT: PASS` or `VERDICT: FAIL` followed by a list of bugs, security issues, or regressions. Style nitpicks are ignored. The result is posted as a PR comment.
 
 ### local/claude-review
 
-Claude runs in critical-only mode — it only flags things that will crash in production, cause data loss, create a security vulnerability, or break existing functionality. If nothing critical, it passes. Also posted as a PR comment.
+Claude runs in critical-only mode. It only reports things that will crash in production, cause data loss, create a security vulnerability, or break existing functionality. If nothing critical is found, it passes. Also posted as a PR comment.
 
 ### local/screenshot-gate
 
-If the PR touches UI files (`.tsx`, `.jsx`, `.css`, `.scss`, `.vue`, `.svelte`), it checks whether the PR description contains a screenshot. No screenshot → fail. Non-UI PRs pass automatically.
+If the PR touches UI files (`.tsx`, `.jsx`, `.css`, `.scss`, `.vue`, `.svelte`), it checks whether the PR description contains a screenshot. No screenshot → fails. Non-UI PRs pass automatically.
 
 ### local/gemini-review
 
-Checks whether Gemini Code Assist (GitHub App) has reviewed or commented on the PR. If `requireGemini: true` in the project config, this gate must pass before the task is marked `review_ready`. The app is free to install at [github.com/apps/gemini-code-assist](https://github.com/apps/gemini-code-assist).
-
-To require Gemini before merge:
-
-```json
-"requireGemini": true
-```
+Checks whether [Gemini Code Assist](https://github.com/apps/gemini-code-assist) (GitHub App, free) has reviewed or commented on the PR. With `requireGemini: true` in the project config, this gate must pass before the task is marked `review_ready`. Gemini is independent from Codex and Claude and tends to catch different things.
 
 ### GitHub token permissions
 
 The `gh` CLI needs permission to set commit statuses. Make sure your token has the `repo` scope (or `statuses:write` for fine-grained tokens).
+
+## Auto-retry
+
+When CI or a review fails, `check-agents.sh` automatically calls `respawn-agent.sh` with a new prompt that includes:
+- Review comments from the PR
+- Inline comments from the diff
+- Names of failed checks
+- The original task prompt
+- Hints from `patterns.log` (see below)
+
+This repeats up to `maxAttempts` times. After that, you get an `AGENT EXHAUSTED` notification.
+
+Manual respawn:
+
+```bash
+bash ~/.agent-swarm/scripts/respawn-agent.sh \
+  --project myproject \
+  fix-login-bug \
+  "Previous attempt broke the tests. Fix only session handling, don\'t touch the router."
+```
+
+## patterns.log
+
+Each time an agent succeeds after a retry, a hint is written to `$SWARM_HOME/patterns.log`. On the next retry for a similar task, these hints are injected into the prompt automatically.
+
+Over time this file becomes a list of common failure modes and what fixed them. You can also edit it manually to add project-specific guidance that should always be considered during retries.
+
+## Mid-task steering
+
+If an agent is going in the wrong direction, send a correction directly into its tmux session:
+
+```bash
+tmux send-keys -t fix-login-bug "Don\'t touch session.ts, the bug is in middleware/auth.ts" Enter
+```
+
+The inner session name matches the task ID.
+
+## Checking status
+
+```bash
+bash ~/.agent-swarm/scripts/check-agents.sh --project myproject
+# or all projects
+bash ~/.agent-swarm/scripts/check-agents.sh --all
+```
 
 ## Notifications
 
@@ -130,40 +222,7 @@ When something happens, a line is appended to `$SWARM_HOME/notifications.pending
 [2026-03-03T10:10:00Z] NOTIFY: [myproject] AGENT EXHAUSTED fix-login-bug — all 3 attempts used
 ```
 
-Read and clear it however you want — cron, webhook, custom script.
-
-## Auto-retry
-
-When CI or a review fails, the swarm respawns the agent with the failure context (review comments, failed check names, original task prompt) injected into the new prompt. This repeats up to `maxAttempts` times.
-
-After all attempts are exhausted, you get an `AGENT EXHAUSTED` notification and handle it yourself.
-
-Manual respawn with a corrected prompt:
-
-```bash
-bash ~/.agent-swarm/scripts/respawn-agent.sh \
-  --project myproject \
-  fix-login-bug \
-  "Previous attempt broke the tests. Fix only session handling, don't touch the router."
-```
-
-## Mid-task steering
-
-If the agent is going in the wrong direction, send it a message directly in tmux:
-
-```bash
-tmux send-keys -t fix-login-bug "Don't touch session.ts, the bug is in middleware/auth.ts" Enter
-```
-
-The inner session name matches the task ID.
-
-## Checking status
-
-```bash
-bash ~/.agent-swarm/scripts/check-agents.sh --project myproject
-# or all projects at once
-bash ~/.agent-swarm/scripts/check-agents.sh --all
-```
+Read and clear it however you want. With OpenClaw, this happens automatically via heartbeat or `notify-instant.sh`.
 
 ## Directory structure
 
@@ -176,6 +235,7 @@ bash ~/.agent-swarm/scripts/check-agents.sh --all
     local-review.sh      # codex + claude + gemini + screenshot review
     respawn-agent.sh     # retry a failed task with a new prompt
     monitor-loop.sh      # cron entrypoint
+    notify-instant.sh    # instant notification on pending file change
     cleanup-agents.sh    # remove stale worktrees and tmux sessions
   projects/
     example.json
@@ -183,13 +243,13 @@ bash ~/.agent-swarm/scripts/check-agents.sh --all
     myproject/
       fix-login-bug.txt  # task prompt, auto-created by spawn-agent.sh
   notifications.pending  # append-only event log
-  monitor.log            # full scheduler output
-  patterns.log           # hints accumulated from successful runs
+  monitor.log
+  patterns.log
 ```
 
 ## AGENTS.md
 
-Put an `AGENTS.md` in your repo root. The swarm reads it at the start of every task. Less context = more mistakes.
+Put an `AGENTS.md` in your repo root. The swarm reads it at the start of every task.
 
 ```markdown
 # AGENTS.md
@@ -206,47 +266,7 @@ Put an `AGENTS.md` in your repo root. The swarm reads it at the start of every t
 
 ## Tips
 
-- Keep tasks small. "Refactor the entire auth system" will fail. "Extract token refresh into a separate service" will work.
-- Gemini Code Assist is free and independent from Codex/Claude — it catches different things. Worth installing.
-- `patterns.log` accumulates hints from successful runs and gets injected into retry prompts automatically.
-- The `auto` agent type works well as a default once you know your codebase is split between backend and frontend.
-
-## Orchestration with OpenClaw
-
-The swarm is headless by design — it doesn’t know what to build or when. That’s the orchestrator’s job.
-
-In this setup, [OpenClaw](https://github.com/openclaw/openclaw) acts as the brain. It runs as a persistent AI agent connected to Telegram (or any other channel). It reads `notifications.pending` on a heartbeat schedule, decides what needs attention, spawns tasks, and steers agents mid-run.
-
-### How the loop works
-
-```
-You (Telegram)  →  OpenClaw  →  spawn-agent.sh  →  Codex/Claude
-                                                  →  PR opens
-notifications.pending  →  OpenClaw heartbeat  →  you get pinged
-You approve  →  gh pr merge
-```
-
-1. You describe a task to OpenClaw in plain language
-2. OpenClaw calls `spawn-agent.sh` with the right project, task ID, agent type, and prompt
-3. The agent works, opens a PR
-4. `check-agents.sh` runs on cron, reviews complete, a line is written to `notifications.pending`
-5. OpenClaw reads `notifications.pending` on the next heartbeat and messages you
-6. You review the PR and merge
-
-If a review fails or an agent gets stuck, OpenClaw handles the respawn — with context from the failure injected into the new prompt.
-
-### OpenClaw HEARTBEAT.md example
-
-```markdown
-## Agent Swarm notifications
-
-Check ~/. agent-swarm/notifications.pending.
-- If it has content: read it, send each line to Telegram, then clear the file.
-- If empty: do nothing.
-```
-
-### Why this works
-
-The swarm handles the mechanical parts: worktrees, tmux sessions, PR lifecycle, commit statuses, retry logic. OpenClaw handles judgment: what to build, when to intervene, when to escalate. Neither needs to know the internals of the other.
-
-You end up with a setup where you can describe a task over Telegram while commuting, and by the time you're back at your desk there's a PR waiting for review.
+- Keep tasks small and scoped. "Refactor the entire auth system" will fail. "Extract token refresh into a separate service" will work.
+- Gemini Code Assist is free and independent — it catches different things than Codex and Claude. Worth installing.
+- `auto` agent routing works well as a default once you have a clear frontend/backend split.
+- The whole thing runs on a laptop or a cheap VPS. No cloud infra needed.
